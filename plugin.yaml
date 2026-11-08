@@ -1,0 +1,6 @@
+name: env-brief
+version: 1.0.0
+description: "System-level host facts injected into each session's system prompt (frozen at first build; re-rendered verbatim at compact). Data: /root/.hermes/env-brief.yaml."
+enabled: true
+provides_hooks:
+  - on_session_start
