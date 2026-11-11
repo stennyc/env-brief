@@ -102,7 +102,7 @@ _PROBES = {
     "cpu_cores": ["nproc"],
     "memory_total": ["sh", "-c", "free -h | awk '/^Mem:/{print $2}'"],
     "disk_root_avail": ["sh", "-c", "df -h / | awk 'NR==2{print $4}'"],
-    "shell": ["sh", "-c", "readlink -f $(command -v sh)"],
+    "shell": ["sh", "-c", "getent passwd \"$(whoami)\" | cut -d: -f7"],
     "user": ["whoami"],
     "timezone": ["sh", "-c", "date +%z"],
     "timezone_ianna": ["sh", "-c", "readlink -f /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || cat /etc/timezone 2>/dev/null"],
