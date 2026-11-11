@@ -36,7 +36,7 @@ _CLOCK_NOTE = (
 )
 
 
-def _render_brief() -> str:
+def _render_brief(session_info=None) -> str:
     """Pure function of the yaml bytes; any failure degrades to a placeholder
     (never raises into the prompt build - the native fail-open contract)."""
     try:
