@@ -202,6 +202,7 @@ Steps:
 
 | File | Purpose |
 |---|---|
+| `LICENSE` | MIT — full text |
 | `plugin.yaml` | Hermes plugin manifest: name, version, description, `provides_hooks: [on_session_start]`, enabled |
 | `__init__.py` | The whole plugin: `register(ctx)` (section + `env_time` tool + session-start probe/merge hook), probe/merge code, pure-fn renderer |
 | `~/.hermes/env-brief.yaml` *(user data, not in this repo)* | The single shared facts file the section is rendered from |
