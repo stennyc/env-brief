@@ -4,6 +4,36 @@ Hermes Agent plugin: **system-level host facts in the system prompt + a live-clo
 
 One YAML file → one frozen section in every session's system prompt → zero prompt drift, prefix-cache friendly, hot-applies at the next compact boundary.
 
+
+## Installation
+
+### Linux
+
+```bash
+git clone https://github.com/stennyc/env-brief.git ~/.hermes/plugins/env-brief
+bash ~/.hermes/plugins/env-brief/install.sh --all-profiles
+```
+
+### Windows (PowerShell)
+
+```powershell
+git clone https://stennyc@github.com/stennyc/env-brief.git "C:\Users\$env:USERNAME\AppData\Local\hermes\plugins\env-brief"
+& "C:\Users\$env:USERNAME\AppData\Local\hermes\plugins\env-brief\install.ps1" -AllProfiles
+```
+
+### Enable in profile config
+
+Add `env-brief` to `plugins.enabled` in the profile's `config.yaml`:
+
+```yaml
+plugins:
+  enabled:
+  - filemem
+  - env-brief
+```
+
+Then restart the Hermes gateway.
+
 ## Why it exists
 
 By design, a Hermes session's system prompt freezes its "Conversation started:" timestamp at session start ("cache stability, not live-clock-keeping"), and knows nothing about the host machine itself. LLMs therefore have no way to know:
