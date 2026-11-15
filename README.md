@@ -1,6 +1,5 @@
 # env-brief
 
-<<<<<<< HEAD
 Hermes Agent plugin: **system-level host facts in the system prompt + a live-clock tool** (`env_time`), with **auto-probe** of the machine's identity, and a **single shared data file** that stays byte-stable under a multiplexed (one-gateway, many-profiles) Hermes setup.
 
 One YAML file → one frozen section in every session's system prompt → zero prompt drift, prefix-cache friendly, hot-applies at the next compact boundary.
@@ -207,48 +206,3 @@ Steps:
 | `plugin.yaml` | Hermes plugin manifest: name, version, description, `provides_hooks: [on_session_start]`, enabled |
 | `__init__.py` | The whole plugin: `register(ctx)` (section + `env_time` tool + session-start probe/merge hook), probe/merge code, pure-fn renderer |
 | `~/.hermes/env-brief.yaml` *(user data, not in this repo)* | The single shared facts file the section is rendered from |
-=======
-
-## Installation
-
-### Linux
-
-```bash
-# Clone to Hermes plugin directory
-git clone https://github.com/stennyc/env-brief.git ~/.hermes/plugins/env-brief
-
-# Auto-install to all profiles that have it enabled in config.yaml:
-bash ~/.hermes/plugins/env-brief/install.sh --all-profiles
-```
-
-### Windows (PowerShell)
-
-```powershell
-# Clone to both plugin directories (AppData + ~/.hermes)
-git clone https://stennyc@github.com/stennyc/env-brief.git "C:\Users\$env:USERNAME\AppData\Local\hermes\plugins\env-brief"
-& "C:\Users\$env:USERNAME\AppData\Local\hermes\plugins\env-brief\install.ps1" -AllProfiles
-```
-
-### Enable in profile config
-
-Add `env-brief` to `plugins.enabled` in the target profile's `config.yaml`:
-
-```yaml
-plugins:
-  enabled:
-  - filemem
-  - env-brief
-  # ... other plugins
-```
-
-Then restart the Hermes gateway.
-
-### Dual-path note (Windows)
-
-Hermes on Windows stores plugins in two locations:
-- `C:\Users\<user>\AppData\Local\hermes\plugins\` (primary, loaded at runtime)
-- `~/.hermes/plugins/` (sync copy, used by some tools)
-
-The install scripts above copy to **both** locations automatically.
-
->>>>>>> 6135136 (feat: add install.sh + install.ps1 with dual-path support)
