@@ -1,0 +1,39 @@
+# CI: run the test suite on all three OS families the probes support.
+# The fcntl (POSIX lock) branch and the real Linux/macOS probe commands
+# were previously only exercised by hand on this dev host; this matrix
+# runs them on every push/PR. The msvcrt slow-lock regression (P1,
+# ~13s holder scenario) is opt-in and runs ONLY on windows-latest:
+# ENVBRIEF_SLOW_TESTS=1.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11"]
+        slow: ["0"]
+        include:
+          - os: windows-latest
+            python-version: "3.11"
+            slow: "1"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install deps
+        run: python -m pip install --upgrade pip pytest pyyaml
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+        env:
+          ENVBRIEF_SLOW_TESTS: ${{ matrix.slow }}
