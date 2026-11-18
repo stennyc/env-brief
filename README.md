@@ -49,6 +49,16 @@ env-brief fixes this at the **prompt layer**, not the conversation layer:
    `$HERMES_HOME` to the first ancestor holding `env-brief.yaml` or a
    `profiles/` dir; fallbacks `~/.hermes/env-brief.yaml` and, on Windows,
    `%APPDATA%/hermes/env-brief.yaml`) holds the facts.
+   **Legacy shadow (pre-1.1.0 installs)**: `<=1.0.x` installers wrote the
+   data file INTO the profile home. Walk-up still finds it first and keeps
+   using it (switching files would drift the rendered section — stability
+   > drift), but now logs a `SHADOWS the multiplexed shared root` warning
+   at session start. One machine should hold ONE shared file at the shared
+   root (next to `profiles/`); if the warning fires, delete the legacy
+   profile-local copy and let the shared-root file own the data — the
+   warning disappears and the 2026-11-08 one-file-per-machine invariant is
+   restored (observability landed in the 2026-11-18 rescan, owner ruling
+   option (b): warn, never switch).
 2. `register()` injects a rendered section into each session's system prompt (`ctx.register_system_prompt_section`), positioned after the memory section.
 3. The section is a **pure function of the file's bytes** — no timestamps, no per-session state — so it is byte-identical across the whole session and across compactions. Edit the file, and the change hot-applies at the next compact boundary; no gateway restart needed.
 4. Exact, on-demand time is a **tool call** (`env_time`), not a live clock burned into the prompt — you only pay for it when the model actually needs the precise moment.

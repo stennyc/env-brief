@@ -77,6 +77,27 @@ def _shared_root_for_profile_home(profile_home: str):
     return None
 
 
+def _shadowed_by_multiplex_root(root) -> bool:
+    """Owner ruling 2026-11-08 'one file per machine' audit (rescan P2,
+    2026-11-18): TRUE when the resolved root was found by the LOCAL
+    env-brief.yaml check (no profiles/ dir at its own level) while a
+    HIGHER ancestor holds a profiles/ dir - i.e. a legacy <=1.0.x
+    profile-local data file is shadowing the multiplexed shared root,
+    which silently breaks the single-file invariant (every profile reads
+    its own copy). Behavior is deliberately UNCHANGED (stability > drift);
+    the caller only logs. Walked back within the same 12-level bound."""
+    if (root / "profiles").is_dir():
+        return False  # the root itself is the shared root - no shadow
+    p = root.parent
+    for _ in range(12):
+        if (p / "profiles").is_dir():
+            return True
+        if p.parent == p:
+            return False
+        p = p.parent
+    return False
+
+
 def _resolve_env_brief_path() -> str:
     import pathlib
     home_hermes = _os.environ.get("HERMES_HOME", "").strip()
@@ -84,6 +105,19 @@ def _resolve_env_brief_path() -> str:
     if home_hermes:
         shared = _shared_root_for_profile_home(home_hermes)
         if shared is not None:
+            if _shadowed_by_multiplex_root(shared):
+                # A legacy profile-local data file (the <=1.0.x installers
+                # wrote into HERMES_HOME) is shadowing the multiplexed
+                # shared root. Do NOT switch files (stability > drift -
+                # the switch would drift the rendered section at the next
+                # compact); make the invariant break observable instead.
+                logger.warning(
+                    "env-brief: resolved data file %s sits in a profile-local "
+                    "dir that SHADOWS the multiplexed shared root above it "
+                    "(which holds profiles/). One machine should have one "
+                    "shared file - delete the legacy copy to restore the "
+                    "single-file invariant.",
+                    shared / "env-brief.yaml")
             return str(shared / "env-brief.yaml")
         # F4 (rescan 2026-11-18): the walk-up bound (12 levels) was reached
         # without finding env-brief.yaml or a profiles/ dir - fall through

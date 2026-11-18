@@ -404,6 +404,37 @@ def test_resolve_fallback_appdata_windows(eb, tmp_path, monkeypatch):
     assert eb._resolve_env_brief_path() == str(fakeapp / "hermes" / "env-brief.yaml")
 
 
+def test_shadowed_legacy_profile_local_file_warns(eb, tmp_path, monkeypatch, caplog):
+    """P2-1 (owner ruling 2026-11-08 'one file per machine', rescan): a
+    legacy <=1.0.x profile-local data file shadows the multiplexed shared
+    root -> walk-up resolves to it and logs a warning (behavior unchanged,
+    observability added)."""
+    import logging
+    hermes_root = tmp_path / "hermes"          # shared root (holds profiles/)
+    (hermes_root / "profiles" / "x").mkdir(parents=True)
+    profile_home = hermes_root / "profiles" / "x"
+    (profile_home / "env-brief.yaml").write_text(
+        "--- header ---\n# legacy profile-local copy\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    with caplog.at_level(logging.WARNING, logger="env-brief"):
+        p = eb._resolve_env_brief_path()
+    assert p == str(profile_home / "env-brief.yaml")  # behavior UNCHANGED
+    assert any("SHADOWS" in r.message for r in caplog.records)
+
+def test_shared_root_itself_is_not_a_shadow(eb, tmp_path, monkeypatch, caplog):
+    """Same tree but the data file lives at the shared root (the CORRECT
+    one-file-per-machine layout) -> no warning."""
+    import logging
+    hermes_root = tmp_path / "hermes"
+    (hermes_root / "profiles" / "x").mkdir(parents=True)
+    (hermes_root / "env-brief.yaml").write_text("# shared\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_root / "profiles" / "x"))
+    with caplog.at_level(logging.WARNING, logger="env-brief"):
+        p = eb._resolve_env_brief_path()
+    assert p == str(hermes_root / "env-brief.yaml")
+    assert not any("SHADOWS" in r.message for r in caplog.records)
+
+
 def test_resolve_walk_up_survives_deep_install(eb, tmp_path, monkeypatch):
     # F4 (rescan 2026-11-18): the walk-up is bounded so a pathological path
     # cannot loop; the bound must still cover realistic depths. The data
