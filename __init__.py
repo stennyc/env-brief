@@ -62,7 +62,10 @@ def _shared_root_for_profile_home(profile_home: str):
     when neither is found (the caller falls back to ~/.hermes)."""
     import pathlib
     p = pathlib.Path(profile_home)
-    for _ in range(8):  # bounded: a path is never more than ~8 levels deep
+    for _ in range(12):  # bounded: any supported install layout is <= ~12
+        # levels deep (F4, rescan 2026-11-18: the old range(8) gave up on
+        # realistic 9-11 level layouts and silently fell back to
+        # ~/.hermes - a DIFFERENT file than the operator intended);
         if (p / "env-brief.yaml").exists():
             return p
         if (p / "profiles").is_dir():
@@ -82,6 +85,15 @@ def _resolve_env_brief_path() -> str:
         shared = _shared_root_for_profile_home(home_hermes)
         if shared is not None:
             return str(shared / "env-brief.yaml")
+        # F4 (rescan 2026-11-18): the walk-up bound (12 levels) was reached
+        # without finding env-brief.yaml or a profiles/ dir - fall through
+        # to the ~/.hermes / APPDATA fallbacks, but make it observable: a
+        # silent fallback to a DIFFERENT file than HERMES_HOME implies is
+        # exactly how the old range(8) misbehaved.
+        logger.warning(
+            "env-brief: walk-up from HERMES_HOME=%s found no shared root "
+            "within 12 levels; falling back to the default location",
+            home_hermes)
     # 2. ~/.hermes, when that dir already exists (the normal case under a
     #    live hermes runtime, which creates HERMES_HOME at boot).
     home_dir = pathlib.Path.home() / ".hermes"

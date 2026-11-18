@@ -327,6 +327,26 @@ def test_resolve_fallback_appdata_windows(eb, tmp_path, monkeypatch):
     assert eb._resolve_env_brief_path() == str(fakeapp / "hermes" / "env-brief.yaml")
 
 
+def test_resolve_walk_up_survives_deep_install(eb, tmp_path, monkeypatch):
+    # F4 (rescan 2026-11-18): the walk-up is bounded so a pathological path
+    # cannot loop; the bound must still cover realistic depths. The data
+    # file sits 11 levels ABOVE the profile home, in a non-multiplexed
+    # layout (no profiles/ subdirs on the way up - the walk only finds the
+    # yaml itself): the old range(8) bound gave up after 8 hops and
+    # silently fell back to ~/.hermes; range(12) reaches the yaml at hop
+    # 11. This is the exact failure the bound was meant to make visible
+    # rather than infinite (a path is never more than ~12 levels deep in
+    # any supported install layout).
+    shared = tmp_path
+    (shared / "env-brief.yaml").write_text("host: x\n", encoding="utf-8")
+    node = shared
+    for i in range(1, 12):
+        node = node / f"lvl{i}"
+    node.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(node))
+    assert eb._resolve_env_brief_path() == str(shared / "env-brief.yaml")
+
+
 # ---------------------------------------------------------------------------
 # render: pure function of the yaml bytes (prefix-cache invariant)
 # ---------------------------------------------------------------------------
