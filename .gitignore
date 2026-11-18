@@ -1,1 +1,5 @@
 __pycache__/
+.pytest_cache/
+# data-file side effects, if the data path ever lands inside this dir
+env-brief.yaml
+env-brief.yaml.lock

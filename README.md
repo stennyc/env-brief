@@ -17,7 +17,7 @@ bash ~/.hermes/plugins/env-brief/install.sh --all-profiles
 ### Windows (PowerShell)
 
 ```powershell
-git clone https://stennyc@github.com/stennyc/env-brief.git "C:\Users\$env:USERNAME\AppData\Local\hermes\plugins\env-brief"
+git clone https://github.com/stennyc/env-brief.git "C:\Users\$env:USERNAME\AppData\Local\hermes\plugins\env-brief"
 & "C:\Users\$env:USERNAME\AppData\Local\hermes\plugins\env-brief\install.ps1" -AllProfiles
 ```
 
@@ -45,7 +45,10 @@ unless they go dig it out with `terminal`/`date` every time — and guessing the
 
 env-brief fixes this at the **prompt layer**, not the conversation layer:
 
-1. A small YAML data file (default: `~/.hermes/env-brief.yaml`) holds the facts.
+1. A small YAML data file (the shared HERMES root — walked up from the live
+   `$HERMES_HOME` to the first ancestor holding `env-brief.yaml` or a
+   `profiles/` dir; fallbacks `~/.hermes/env-brief.yaml` and, on Windows,
+   `%APPDATA%/hermes/env-brief.yaml`) holds the facts.
 2. `register()` injects a rendered section into each session's system prompt (`ctx.register_system_prompt_section`), positioned after the memory section.
 3. The section is a **pure function of the file's bytes** — no timestamps, no per-session state — so it is byte-identical across the whole session and across compactions. Edit the file, and the change hot-applies at the next compact boundary; no gateway restart needed.
 4. Exact, on-demand time is a **tool call** (`env_time`), not a live clock burned into the prompt — you only pay for it when the model actually needs the precise moment.
@@ -62,7 +65,8 @@ This is the "90% of the time on-demand is enough; the other 10% gets a real cloc
 ## How it works
 
 ```
-~/.hermes/env-brief.yaml          ← one file, system-level (not per-profile)
+shared HERMES root/env-brief.yaml   ← one file, system-level (not per-profile;
+                                       walked up from $HERMES_HOME - see above)
         │
         ▼  (on_session_start)
    machine probe + merge-back      ← auto-fills facts, detects stale/copied files
@@ -75,12 +79,12 @@ This is the "90% of the time on-demand is enough; the other 10% gets a real cloc
 
 ### Auto-probe + merge-back
 
-On every session start, env-brief probes the machine (ONCE — the result is reused by both the trigger check and the merge) and merges into the YAML file. The probe dispatches per OS: POSIX (Linux/macOS) runs one short subprocess per fact (`hostname`, `uname -s` (stable family name, never the kernel release), `nproc`/`sysctl`/`getconf`, `free -h`/`hw.memsize`, `df -h`, login shell via `getent`/`dscl`, `whoami`, timezone, root/sudo/home-writable checks, container detection); Windows batches into exactly two calls (one PowerShell: admin check + IANA timezone; one live-Python: UTC offset + CPU + disk + memory).
+On every session start, env-brief probes the machine (ONCE — the result is reused by both the trigger check and the merge) and merges into the YAML file. The probe dispatches per OS: POSIX (Linux/macOS) runs one short subprocess per fact (`hostname`, `uname -s` (stable family name, never the kernel release), `nproc`/`sysctl`/`getconf`, `free -h`/`hw.memsize`, `df -h`, login shell via `getent`/`dscl`, `whoami`, timezone, root/sudo/home-writable checks, container detection); Windows batches into exactly two calls (one PowerShell: admin check + timezone name — a Windows tz id like "Singapore Standard Time", not an IANA name; one live-Python: UTC offset + CPU + disk + memory).
 
 - **Trigger fields** (`host`, `os`, `arch`) are **always overwritten** with the live value when it differs — no hand-written value survives a mismatch. This also catches the "I copied an old `env-brief.yaml` from another machine" case: if the live `host`/`os`/`arch` don't match the file, it's treated as stale and re-probed.
 - **All other fields** are **fill-only**: a missing/empty field gets probed; an existing field is never clobbered by the probe.
-- `user_timezone_hint` is **code-generated, never hand-typed**: it's derived from the probed `timezone` (numeric offset) + `timezone_ianna` (IANA name) pair, so it can't go stale relative to the machine it describes.
-- The write is **atomic** (`tempfile` + `os.replace`), and the whole read-modify-write is serialized on a **shared sentinel lock** — `env-brief.yaml.lock`, a sibling of the data file (`fcntl.flock` on POSIX, `msvcrt.locking` on Windows) — so two multiplexed gateway processes racing the same session start cannot lose each other's updates.
+- `user_timezone_hint` is **code-generated, never hand-typed**: it's derived from the probed `timezone` (numeric offset) + `timezone_ianna` (timezone name — a Windows tz id on Windows, an IANA name on POSIX) pair, so it can't go stale relative to the machine it describes. Path-shaped values (raw filesystem paths leaking in via a distro's `readlink` target or a hand edit) are rejected by the hint layer and fall back to the UTC offset label.
+- The write is **atomic** (`tempfile` + `os.replace`), and the whole read-modify-write is serialized on a **shared sentinel lock** — `env-brief.yaml.lock`, a sibling of the data file (`fcntl.flock` on POSIX, `msvcrt.locking` byte-0 on Windows) — so two multiplexed gateway processes racing the same session start cannot lose each other's updates. (Windows detail: a blocking `msvcrt` request is killed by the OS at ~9s with EDEADLK, so the Windows branch polls non-blocking requests with a 30s deadline; POSIX `flock` waits indefinitely.)
 - The file's leading comment block (the header explaining what the file is) is preserved verbatim across every rewrite — `yaml.safe_dump` alone would drop it, so the plugin re-attaches it explicitly.
 - Probe scope is **machine/OS/hardware/permissions only** — deliberately no toolchain (no python path/version fields).
 
@@ -106,7 +110,7 @@ Rendering **fails open**: a missing file, malformed YAML, or missing PyYAML all 
 
 - Hermes Agent (the `register(ctx)` plugin API: `register_system_prompt_section`, `register_tool`, `register_hook`)
 - Python 3 with `yaml` (PyYAML) — ships with the Hermes runtime; if it's ever missing, the section degrades to a placeholder, nothing crashes
-- Linux host (probe commands assume `uname`/`nproc`/`free`/`df`/`getent`; on other platforms the affected fields simply come back missing and stay unfilled)
+- Windows / macOS / Linux host (probes dispatch per OS: POSIX runs GNU-first chains with BSD fallbacks — `sysctl`/`dscl` cover macOS where `nproc`/`free`/`getent` are absent; Windows batches into two subprocesses, PowerShell + the live Python interpreter; a tool that's missing on a host just leaves that field unfilled)
 
 ## Install
 
@@ -138,9 +142,10 @@ hermes gateway restart                          # or `hermes -p <name> gateway r
 ### 3. Create (or auto-create) the data file
 
 ```yaml
-# ~/.hermes/env-brief.yaml
+# env-brief.yaml (shared HERMES root - walked up from $HERMES_HOME; fallbacks
+# ~/.hermes or %APPDATA%/hermes on Windows)
 host: myhost
-os: Linux 6.17.9-1-pve
+os: Linux            # stable family name - NEVER the kernel release (M1)
 arch: x86_64
 cpu_cores: '4'
 memory_total: 12Gi
@@ -167,8 +172,8 @@ hermes gateway restart
 
 What that means for env-brief specifically:
 
-1. **The data file is system-level by design.** It's an absolute path, never resolved through the per-profile `HERMES_HOME` (which *is* what changes per profile under a multiplexed gateway). Every profile's sessions, served by the one multiplexer, read the same file. There is exactly one source of truth per machine — that's the whole point of putting it here instead of in a per-profile dir.
-2. **The probe/merge is race-safe.** Two profiles' sessions can start in the same multiplexer process (or even two standalone gateways, one per profile, if you run in the non-multiplex mode) at overlapping times and both try to re-probe the machine at session start. The merge is done under an exclusive `fcntl.flock` on the temp file, atomically renamed into place — no interleaved half-writes.
+1. **The data file is system-level by design.** It's an absolute path, resolved ONCE per process by walking UP from the live profile's `HERMES_HOME` to the shared HERMES root (the first ancestor holding `env-brief.yaml` or a `profiles/` dir — every profile under one gateway lands on the SAME file), with `~/.hermes` / `%APPDATA%/hermes` fallbacks. Every profile's sessions, served by the one multiplexer, read the same file. There is exactly one source of truth per machine — that's the whole point of putting it here instead of in a per-profile dir.
+2. **The probe/merge is race-safe.** Two profiles' sessions can start in the same multiplexer process (or even two standalone gateways, one per profile, if you run in the non-multiplex mode) at overlapping times and both try to re-probe the machine at session start. The whole read-modify-write is serialized on the shared sentinel lock (`env-brief.yaml.lock` beside the data file — `flock` on POSIX, `msvcrt` byte-0 on Windows; the Windows branch polls non-blocking requests because the OS kills a blocking one at ~9s), and the file itself is written via temp-file + atomic rename — no interleaved half-writes.
 3. **Don't install it N times, N = number of profiles.** A real git checkout per profile (default profile + `profiles/coder` + `profiles/devops` + …) gives you N independent copies that each need their own `git pull` to stay in sync — that's the "multiple copies" problem this section exists to avoid. Use **one** of:
    - **Recommended (zero-copy):** install once in the default profile's `plugins/`, enable it only there. The multiplexer serves all profiles from that one process; the data file is absolute-path, profile-independent; nothing per-profile needs to exist.
    - **Symlink fan-out:** install once in the default profile; `ln -s` it into each named profile's `plugins/` dir if you still want each profile to list it in its own `plugins.enabled` (e.g. because you run standalone per-profile gateways, not the multiplexer). One checkout, many links, no drift.
@@ -194,10 +199,13 @@ Rules — do NOT create multiple copies of the plugin:
    ~/.hermes/profiles/<name>/plugins/env-brief. Never git-clone a second real tree per profile.
 2. If multiplex mode is OFF (standalone per-profile gateways), still use one checkout in the
    default profile + symlinks into each named profile — never N real checkouts.
-3. The plugin's data file is SYSTEM-LEVEL: it lives at ~/.hermes/env-brief.yaml (the shared /
-   default-profile root, an absolute path that is deliberately NOT resolved through the
-   per-profile HERMES_HOME that a multiplexed gateway switches on per served profile). Do not
-   create a separate env-brief.yaml per profile — one machine, one file.
+3. The plugin's data file is SYSTEM-LEVEL: it lives in the shared HERMES root,
+   which the plugin discovers by walking UP from a profile's HERMES_HOME to
+   the first ancestor that holds an env-brief.yaml or a profiles/ directory
+   (fallbacks: ~/.hermes/env-brief.yaml, and on Windows %APPDATA%/hermes/
+   env-brief.yaml). It is NOT per-profile and is NOT seeded into a profile's
+   own HERMES_HOME. Do not create a separate env-brief.yaml per profile —
+   one machine, one file.
 
 Steps:
 4. git clone https://github.com/stennyc/env-brief.git ~/.hermes/plugins/env-brief
@@ -209,7 +217,9 @@ Steps:
 6. Enable it: add `env-brief` to plugins.enabled in the config.yaml of every profile that
    should run it (default profile's config.yaml at minimum; named profiles' config.yaml only
    if you chose the symlink fan-out in step 5).
-7. Create/seed the shared data file ~/.hermes/env-brief.yaml if it doesn't exist (a minimal
+7. Create/seed the shared data file (in the shared HERMES root found in rule
+   3 - typically the parent of the profiles/ dir, NOT inside a profile's own
+   HERMES_HOME) if it doesn't exist (a minimal
    key: value stub is fine — the plugin auto-probes host/os/arch/cpu/memory/disk/user/
    timezone/root/sudo/home-writable on the next session start and fills anything missing;
    the three trigger fields host/os/arch are always overwritten with live values when they
@@ -220,8 +230,8 @@ Steps:
      mode those attach to the host multiplexer, they must not spawn a second gateway).
    - multiplex mode OFF → restart each profile's own standalone gateway, one at a time.
 9. Verify: start a session (any profile), confirm the system prompt now contains a
-   "## Local Environment Brief (system-level; …)" section, confirm ~/.hermes/env-brief.yaml
-   was created/auto-updated on first session start, and confirm `env_time` is available as a
+   "## Local Environment Brief (system-level; …)" section, confirm the shared data file
+   (rule 3's location) was created/auto-updated on first session start, and confirm `env_time` is available as a
    tool (call it once to get the host's real current date/time/timezone).
 10. Done. Report back: the path of the single checkout, which profiles got symlinks vs. a
     real copy, which profiles' config.yaml you enabled it in, the restart command you ran,
@@ -234,5 +244,7 @@ Steps:
 |---|---|
 | `LICENSE` | MIT — full text |
 | `plugin.yaml` | Hermes plugin manifest: name, version, description, `provides_hooks: [on_session_start]`, enabled |
-| `__init__.py` | The whole plugin: `register(ctx)` (section + `env_time` tool + session-start probe/merge hook), probe/merge code, pure-fn renderer |
-| `~/.hermes/env-brief.yaml` *(user data, not in this repo)* | The single shared facts file the section is rendered from |
+| `__init__.py` | The whole plugin: `register(ctx)` (section + `env_time` tool + session-start probe/merge hook), per-OS probes, two-tier merge, shared-sentinel lock, pure-fn renderer |
+| `install.sh` / `install.ps1` | Dual-path installers (POSIX incl. Windows git-bash / native PowerShell) |
+| `tests/` | Cross-platform suite (36+ tests; run `python -m pytest tests/` from the repo root; opt-in slow lock tests via `ENVBRIEF_SLOW_TESTS=1`) |
+| `env-brief.yaml` *(user data, not in this repo)* | The single shared facts file the section is rendered from, in the shared HERMES root |
