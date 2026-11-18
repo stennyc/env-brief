@@ -256,7 +256,7 @@ def test_msvcrt_lock_polling_waits_out_holder(eb, tmp_path):
     assert 1.5 <= waited <= 6.0, f"acquire waited {waited:.2f}s"
 
 
-@pytest.mark.skipif(not os.environ.get("ENVBRIEF_SLOW_TESTS"),
+@pytest.mark.skipif(os.environ.get("ENVBRIEF_SLOW_TESTS") != "1",
                     reason="opt-in ~15s test: ENVBRIEF_SLOW_TESTS=1")
 def test_msvcrt_lock_survives_above_edeadlk_window(eb, tmp_path):
     """P1 regression (slow, opt-in): the 13s holder is > Windows' ~9s

@@ -281,7 +281,14 @@ def _probe_machine_posix() -> dict:
     no crash, no rewrite). macOS fallbacks: cpu via sysctl/getconf,
     memory via hw.memsize, login shell via dscl (getent/nproc/free are
     GNU-only); the IANA zone falls back readlink -f -> readlink ->
-    /etc/timezone across distros."""
+    /etc/timezone across distros.
+
+    Tail note (rescan P3-2): when the 20s cap fires, the pool's
+    shutdown(wait=True) still lets in-flight probes run to their own
+    5s subprocess timeout, so the true worst case is ~25s (cap + up to
+    one per-probe timeout), not a hard 20s. Each worker is bounded by its
+    5s subprocess.run timeout, so the tail is at most ~5s and is the
+    exception, not the norm."""
     import concurrent.futures
     data: dict = {}
     probes = dict(_POSIX_PROBES)

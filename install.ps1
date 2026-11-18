@@ -62,12 +62,19 @@ foreach ($prof in $AllProfs) {
     $cfg = Join-Path "$ProfilesBase\profiles\$prof" "config.yaml"
     $has = $false
     if (Test-Path $cfg) {
-        $has = (Get-Content $cfg -Raw) -match '-\s*env-brief\s*$'
+        # P2-1 (rescan 2026-11-18): (?m) is REQUIRED - the old single-line
+        # '-\s*env-brief\s*$' anchored $ to end-of-FILE, so a profile whose
+        # `- env-brief` entry sits mid-file (the common case) matched
+        # nothing and a plain install linked ZERO profiles. The (?m) form
+        # is end-of-LINE and matches install.sh's per-line grep -E gate
+        # exactly (no more installer semantic split).
+        $has = (Get-Content $cfg -Raw) -match '(?m)^\s*-\s*env-brief\s*$'
     }
-    # -AllProfiles (rescan 2026-11-18 P3: was a dead switch that did
-    # nothing different from a full scan): skip the config.yaml gate and
+    # -AllProfiles (rescan 2026-11-18): skip the config.yaml gate and
     # link EVERY profile. A link is inert unless the profile's config
     # enables env-brief, so this just saves the per-profile hand-edit.
+    # (Pre-P2-1 this was the ONLY path that linked mid-file entries -
+    # see the (?m) fix above.)
     if (-not $has -and -not $AllProfiles) { continue }
     $link = Join-Path "$ProfilesBase\profiles\$prof\plugins" $PluginName
     $src  = Join-Path $WinPlugins $PluginName
