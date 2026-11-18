@@ -62,6 +62,12 @@ def _stub(eb, monkeypatch, probe):
     ({"timezone": "", "timezone_ianna": "Asia/Shanghai"}, "Asia/Shanghai"),
     ({"timezone": "-0330", "timezone_ianna": "America/Sao_Paulo"},
      "America/Sao_Paulo"),
+    # F1: a raw filesystem path sneaking into timezone_ianna (some distros'
+    # readlink targets have no 'zoneinfo/' segment, so the probe's sed does
+    # not match) must NOT be rendered as the zone label - the hint falls
+    # back to the UTC offset label instead.
+    ({"timezone": "+0800", "timezone_ianna": "/usr/lib/tzfile/Asia/KL"},
+     "UTC08:00"),
 ])
 def test_hint_labels(eb, merged, snippet):
     hint = eb._derive_timezone_hint(merged)
@@ -80,6 +86,16 @@ def test_hint_positive_offset_is_signless_fixed_point(eb):
 
 def test_hint_absent_timezone_is_empty(eb):
     assert eb._derive_timezone_hint({}) == ""
+
+
+def test_hint_rejects_pathlike_ianna(eb):
+    # F1 backstop: even if a filesystem path reaches the hint function
+    # (hand-edited yaml, or a probe chain without the shell guard), it
+    # must not be rendered as the zone label.
+    hint = eb._derive_timezone_hint(
+        {"timezone": "+0800", "timezone_ianna": "/usr/lib/tzfile/Asia/KL"})
+    assert "/usr/lib/tzfile" not in hint
+    assert "UTC08:00" in hint
 
 
 # ---------------------------------------------------------------------------

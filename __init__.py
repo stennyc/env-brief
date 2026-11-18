@@ -195,9 +195,10 @@ _POSIX_PROBES: dict = {
     "user": ["whoami"],
     "timezone": ["sh", "-c", "date +%z"],
     "timezone_ianna": ["sh", "-c",
-                       "t=$(readlink -f /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||'); "
+                       "t=$(readlink -f /etc/localtime 2>/dev/null "
+                       "| sed 's|.*/zoneinfo/||' | grep -v '^/'); "
                        "[ -n \"$t\" ] || t=$(readlink /etc/localtime 2>/dev/null "
-                       "| sed 's|.*/zoneinfo/||'); "
+                       "| sed 's|.*/zoneinfo/||' | grep -v '^/'); "
                        "[ -n \"$t\" ] || t=$(cat /etc/timezone 2>/dev/null); "
                        "[ -n \"$t\" ] && echo \"$t\""],
     "user_is_root": ["sh", "-c", "test $(id -u) -eq 0 && echo true || echo false"],
@@ -373,6 +374,14 @@ def _derive_timezone_hint(merged: dict) -> str:
     is the fixed point)."""
     offset = str(merged.get("timezone", "") or "").strip()
     ianna = str(merged.get("timezone_ianna", "") or "").strip()
+    # Defense-in-depth against F1: a raw filesystem path must never be
+    # rendered as an IANA name. It can reach this function via a hand-edited
+    # yaml field even after the probe-side `grep -v '^/'` guard: IANA zone
+    # names never start with '/' or '~' and never contain a backslash or
+    # colon, so reject exactly those shapes (Windows tz ids like
+    # "Malay Peninsula Standard Time" contain none of these either).
+    if ianna.startswith(("/", "~")) or "\\" in ianna or ":" in ianna:
+        ianna = ""
     if not offset and not ianna:
         return ""
     core = offset[1:] if offset[:1] in ("+", "-") else offset
