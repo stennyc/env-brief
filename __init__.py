@@ -12,6 +12,10 @@ Owner rulings (2026-11-08):
   (invalidate_system_prompt) but re-renders are verbatim-identical while the
   file is unchanged -> zero prompt drift, edited file hot-applies at the
   next compact boundary without a gateway restart.
+- Multi-OS (Windows/macOS/Linux) probes + shared-sentinel cross-process
+  lock, 2026-11-18 hardening (defect report: C1 text-mode NUL-anchor
+  TypeError, C2 private-temp-file lock excluded nobody, M1 uname -sr
+  kernel churn, M2 negative-UTC sign loss, M3 missing parent dir).
 """
 from __future__ import annotations
 
@@ -161,27 +165,55 @@ def _env_time(_args) -> dict:
 # ---------------------------------------------------------------------------
 _TRIGGER_FIELDS = ("host", "os", "arch")
 
-def _probe_machine_linux() -> dict:
-    """POSIX probes (Linux/macOS): one subprocess per key, each fails open to
-    a missing key (never a raise into the hook)."""
-    import subprocess
-    probes = {
-        "host": ["hostname"],
-        "os": ["uname", "-sr"],
-        "arch": ["uname", "-m"],
-        "cpu_cores": ["nproc"],
-        "memory_total": ["sh", "-c", "free -h | awk '/^Mem:/{print $2}'"],
-        "disk_root_avail": ["sh", "-c", "df -h / | awk 'NR==2{print $4}'"],
-        "shell": ["sh", "-c", "getent passwd \"$(whoami)\" | cut -d: -f7"],
-        "user": ["whoami"],
-        "timezone": ["sh", "-c", "date +%z"],
-        "timezone_ianna": ["sh", "-c", "readlink -f /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || cat /etc/timezone 2>/dev/null"],
-        "user_is_root": ["sh", "-c", "test $(id -u) -eq 0 && echo true || echo false"],
-        "sudo_available": ["sh", "-c", "command -v sudo >/dev/null 2>&1 && echo true || echo false"],
-        "home_writable": ["sh", "-c", "test -w $(printenv HOME || echo /root) && echo true || echo false"],
-    }
+# The POSIX probe table is a module-level constant (was local to the
+# function) so the cross-platform test suite can run the EXACT expressions
+# on any host that has sh - including Windows git-bash - guarding the
+# nested-quote macOS fallback chains without needing a POSIX machine.
+_POSIX_PROBES: dict = {
+    "host": ["hostname"],
+    # M1: stable OS-family name, NEVER the kernel release. `uname -sr`
+    # churned the trigger field on every kernel upgrade (Tier-1 then
+    # rewrote the shared file) and made the rendered 'os' fact
+    # version-specific; the Windows probe's stable family name
+    # (platform.system() -> "Windows") was the reference behaviour.
+    "os": ["uname", "-s"],
+    "arch": ["uname", "-m"],
+    # macOS has no nproc/free/getent: GNU-first chains with BSD fallbacks
+    # (sysctl hw.ncpu / hw.memsize, dscl for the login shell).
+    "cpu_cores": ["sh", "-c",
+                  "nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null "
+                  "|| getconf _NPROCESSORS_ONLN 2>/dev/null"],
+    "memory_total": ["sh", "-c",
+                     "v=$(free -h 2>/dev/null | awk '/^Mem:/{print $2}'); "
+                     "[ -n \"$v\" ] && echo \"$v\" || { b=$(sysctl -n hw.memsize "
+                     "2>/dev/null); [ -n \"$b\" ] && echo \"$((b/1073741824))Gi\"; }"],
+    "disk_root_avail": ["sh", "-c", "df -h / | awk 'NR==2{print $4}'"],
+    "shell": ["sh", "-c",
+              "out=$(getent passwd \"$(whoami)\" 2>/dev/null | cut -d: -f7); "
+              "[ -n \"$out\" ] || out=$(dscl . -read \"/Users/$(whoami)\" UserShell "
+              "2>/dev/null | awk 'NR==1{print $2}'); [ -n \"$out\" ] && echo \"$out\""],
+    "user": ["whoami"],
+    "timezone": ["sh", "-c", "date +%z"],
+    "timezone_ianna": ["sh", "-c",
+                       "t=$(readlink -f /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||'); "
+                       "[ -n \"$t\" ] || t=$(readlink /etc/localtime 2>/dev/null "
+                       "| sed 's|.*/zoneinfo/||'); "
+                       "[ -n \"$t\" ] || t=$(cat /etc/timezone 2>/dev/null); "
+                       "[ -n \"$t\" ] && echo \"$t\""],
+    "user_is_root": ["sh", "-c", "test $(id -u) -eq 0 && echo true || echo false"],
+    "sudo_available": ["sh", "-c", "command -v sudo >/dev/null 2>&1 && echo true || echo false"],
+    "home_writable": ["sh", "-c", "test -w $(printenv HOME || echo /root) && echo true || echo false"],
+}
+
+
+def _probe_machine_posix() -> dict:
+    """POSIX probes (Linux + macOS): one subprocess per key in
+    _POSIX_PROBES, each fails open to a missing key (never a raise into the
+    hook). macOS fallbacks: cpu via sysctl/getconf, memory via hw.memsize,
+    login shell via dscl (getent/nproc/free are GNU-only); the IANA zone
+    falls back readlink -f -> readlink -> /etc/timezone across distros."""
     data: dict = {}
-    for key, cmd in probes.items():
+    for key, cmd in _POSIX_PROBES.items():
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             val = out.stdout.strip()
@@ -202,58 +234,103 @@ def _probe_machine_linux() -> dict:
 
 def _probe_machine_windows() -> dict:
     """Windows probes (the discarded 2bc7d36 'Windows compatibility' branch,
-    generalized — no hardcoded C:\\Users\\user). host/os/arch are always probed
-    (os from platform, arch from PROCESSOR_ARCHITECTURE / platform.machine);
-    the trigger fields are guaranteed present on either OS so
-    _trigger_probe works identically."""
+    generalized — no hardcoded C:\\Users\\user). host/os/arch are always
+    probed (os from platform, arch from PROCESSOR_ARCHITECTURE /
+    platform.machine), so the trigger fields are guaranteed present on
+    every OS and _trigger_probe works identically.
+
+    Multi-OS hardening (2026-11-18), batched to TWO subprocesses total
+    (was up to four):
+      - one powershell call: admin check + IANA timezone. The admin check
+        uses WindowsPrincipal.IsInRole(Administrators) - the old
+        `net session` check mis-reported non-admin on Windows Home, where
+        the LanmanServer service is absent, and cost an extra ~5s
+        subprocess every session start.
+      - one python call via sys.executable (the LIVE interpreter, not a
+        PATH guess that could resolve to a different one): UTC offset +
+        cpu cores + free disk on the system drive + total memory. The old
+        code probed NONE of cpu/mem/disk on Windows, so a fresh host was
+        missing those facts (only files seeded by an earlier revision kept
+        them, by fill-only luck).
+    Empty values are dropped so `user: ""` never leaks into the yaml
+    (L1: the old code stored the USERNAME env var unconditionally)."""
     import socket
     data: dict = {}
     data["host"] = socket.gethostname()
-    data["os"] = _platform.system()  # "Windows"
+    data["os"] = _platform.system()  # "Windows" - stable family name
     data["arch"] = _os.environ.get("PROCESSOR_ARCHITECTURE") or _platform.machine()
-    data["user"] = _os.environ.get("USERNAME", "")
-    # shell: cmd.exe is the Windows shell equivalent
-    data["shell"] = "cmd.exe"
-    # timezone: wmic is deprecated on modern Win10/11; use the registry via
-    # PowerShell only when available, else fall back to the tz offset via
-    # `date` (cmd has no `date +%z`).
-    try:
-        import subprocess
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "(Get-TimeZone).Id"],
-            capture_output=True, text=True, timeout=10)
-        if out.stdout.strip():
-            data["timezone_ianna"] = out.stdout.strip()
-    except Exception:
-        pass
-    try:
-        import subprocess
-        out = subprocess.run(
-            ["python", "-c",
-             "import datetime; print(datetime.datetime.now().astimezone().strftime('%z'))"],
-            capture_output=True, text=True, timeout=10)
-        val = out.stdout.strip()
-        if val:
-            data["timezone"] = val
-    except Exception:
-        pass
-    # user_is_root / sudo_available: not a meaningful distinction on Windows
-    # (no sudo, admin vs non-admin is the analogue). Probe admin via
-    # `net session` (errors when not admin) — fail-soft to "false".
-    try:
-        import subprocess
-        out = subprocess.run(
-            ["net", "session"],
-            capture_output=True, text=True, timeout=5)
-        data["user_is_root"] = "true" if out.returncode == 0 else "false"
-    except Exception:
-        data["user_is_root"] = "false"
+    user = _os.environ.get("USERNAME", "").strip()
+    if user:
+        data["user"] = user
+    # The OS's default shell: COMSPEC is exactly that. The hermes terminal
+    # may run git-bash ON TOP of it - that is a runtime fact, not a host
+    # fact, so it is intentionally not probed.
+    data["shell"] = _os.environ.get("COMSPEC", "").strip() or "cmd.exe"
     data["sudo_available"] = "false"  # no sudo on Windows
     # home_writable: USERPROFILE is the Windows home
-    home = _os.environ.get("USERPROFILE", "")
+    home = _os.environ.get("USERPROFILE", "").strip()
     data["home_writable"] = "true" if home and _os.path.isdir(home) else "false"
-    return data
+
+    # One powershell call -> "False|Malay Peninsula Standard Time"
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "'{0}|{1}' -f [bool]((New-Object Security.Principal.WindowsPrincipal "
+             "([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole("
+             "[Security.Principal.WindowsBuiltInRole]::Administrator)), "
+             "(Get-TimeZone).Id"],
+            capture_output=True, text=True, timeout=15)
+        left, _, right = out.stdout.partition("|")
+        data["user_is_root"] = "true" if left.strip().lower() == "true" else "false"
+        if right.strip():
+            data["timezone_ianna"] = right.strip()
+    except Exception:
+        data["user_is_root"] = "false"  # fail-soft: non-admin is the safe default
+
+    # One python call (live interpreter) -> 4 lines:
+    # 0: UTC offset (+0800), 1: cpu cores, 2: free disk on the system
+    # drive, 3: total memory (GlobalMemoryStatusEx, bytes -> Gi).
+    probe_code = (
+        "import datetime, os, shutil\n"
+        "print(datetime.datetime.now().astimezone().strftime('%z'))\n"
+        "print(os.cpu_count() or '')\n"
+        "try:\n"
+        "    u = shutil.disk_usage(os.environ.get('SystemDrive') or 'C:')\n"
+        "    print('%dGi' % (u.free // 1073741824))\n"
+        "except Exception:\n"
+        "    print('')\n"
+        "try:\n"
+        "    import ctypes\n"
+        "    class _M(ctypes.Structure):\n"
+        "        _fields_ = [('L', ctypes.c_ulong), ('ML', ctypes.c_ulong), "
+        "('TP', ctypes.c_ulonglong), ('AP', ctypes.c_ulonglong), "
+        "('TPF', ctypes.c_ulonglong), ('APF', ctypes.c_ulonglong), "
+        "('TV', ctypes.c_ulonglong), ('AV', ctypes.c_ulonglong), "
+        "('AEV', ctypes.c_ulonglong)]\n"
+        "    m = _M()\n"
+        "    m.L = ctypes.sizeof(_M)\n"
+        "    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))\n"
+        "    print('%dGi' % (m.TP // 1073741824))\n"
+        "except Exception:\n"
+        "    print('')\n"
+    )
+    try:
+        out = subprocess.run(
+            [sys.executable or "python", "-c", probe_code],
+            capture_output=True, text=True, timeout=15)
+        lines = [ln.strip() for ln in out.stdout.splitlines()]
+        if lines and lines[0]:
+            data["timezone"] = lines[0]
+        if len(lines) > 1 and lines[1]:
+            data["cpu_cores"] = lines[1]
+        if len(lines) > 2 and lines[2]:
+            data["disk_root_avail"] = lines[2]
+        if len(lines) > 3 and lines[3]:
+            data["memory_total"] = lines[3]
+    except Exception:
+        pass
+    # L1: drop empty values - `user: ""` must never leak into the yaml.
+    return {k: v for k, v in data.items() if v not in ("", None)}
 
 
 def _probe_machine() -> dict:
@@ -263,7 +340,7 @@ def _probe_machine() -> dict:
     the Windows probes (and vice-versa if the binary were cross-compiled)."""
     if _IS_WINDOWS:
         return _probe_machine_windows()
-    return _probe_machine_linux()
+    return _probe_machine_posix()
 
 
 def _trigger_probe(existing: dict, live: dict | None = None) -> bool:
@@ -283,22 +360,38 @@ def _trigger_probe(existing: dict, live: dict | None = None) -> bool:
 
 def _derive_timezone_hint(merged: dict) -> str:
     """user_timezone_hint is generated code-side from probed values, never
-    hand-typed: offset comes from the 'timezone' probe (+0800), the IANA name
-    from 'timezone_ianna' (Asia/Kuala_Lumpur) - no guessing between the many
-    zones that share a UTC+8 offset."""
-    offset = merged.get("timezone", "")
-    ianna = merged.get("timezone_ianna", "")
+    hand-typed: offset comes from the 'timezone' probe (+0800 / -0330 /
+    +08:00 / 7), the IANA name from 'timezone_ianna' (Asia/Kuala_Lumpur) -
+    no guessing between the many zones that share one UTC offset.
+
+    Sign rule (M2 fix, 2026-11-18): a NEGATIVE offset keeps its '-' in the
+    rendered label (UTC-03:30 - the old code dropped the sign and rendered
+    a -03:30 zone as UTC03:30, i.e. a different zone). A positive offset
+    renders WITHOUT the '+' (UTC08:00) so the on-disk form on a UTC+ host
+    stays byte-stable across plugin upgrades - no rewrite, no section
+    drift (prefix-cache invariant; the old 2026-11-08 '（UTC08:00）' shape
+    is the fixed point)."""
+    offset = str(merged.get("timezone", "") or "").strip()
+    ianna = str(merged.get("timezone_ianna", "") or "").strip()
     if not offset and not ianna:
         return ""
-    offset = offset.strip()
-    if len(offset) == 5 and offset[1:2].isdigit():
-        offset_hhmm = f"{offset[1:3]}:{offset[3:5]}"
-    else:
-        offset_hhmm = ""
-    label = ianna or (f"UTC{offset_hhmm}" if offset_hhmm else "unknown timezone")
+    core = offset[1:] if offset[:1] in ("+", "-") else offset
+    sign = offset[:1]
+    hhmm = ""
+    if core.count(":") == 1:
+        h, m = core.split(":", 1)
+        if h.isdigit() and m.isdigit():
+            hhmm = f"{int(h):02d}:{int(m):02d}"
+    elif len(core) == 4 and core.isdigit():
+        hhmm = f"{core[:2]}:{core[2:]}"
+    elif len(core) <= 2 and core.isdigit():
+        hhmm = f"{int(core):02d}:00"
+    display_sign = "-" if sign == "-" else ""
+    utc = f"UTC{display_sign}{hhmm}" if hhmm else ""
+    label = ianna or (utc if utc else "unknown timezone")
+    suffix = f"（{utc}）" if utc else ""
     return (
-        f"用户所在时区是 {label}"
-        + (f"（UTC{offset_hhmm}）" if offset_hhmm else "")
+        f"用户所在时区是 {label}" + suffix
         + "；任何涉及当前日期/时间的回复都必须用这个时区，不要用 UTC 或模型训练的默认时区去猜。"
     )
 
