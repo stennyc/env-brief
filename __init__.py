@@ -18,6 +18,9 @@ from __future__ import annotations
 import logging
 import os as _os
 import platform as _platform
+import subprocess
+import sys
+import tempfile
 
 logger = logging.getLogger("hermes_plugins.env_brief")
 
@@ -42,10 +45,10 @@ logger = logging.getLogger("hermes_plugins.env_brief")
 #   3. Windows-only extra fallback: $APPDATA/hermes/env-brief.yaml (the dir
 #      the old hardcoded C:\Users\user\AppData\Local\hermes pointed at).
 #
-# _merge_probe_into_yaml creates the dir on demand (mkstemp dir=dirname), so a
-# fresh host writes into whichever dir resolution lands on; the next session
-# reads the same dir (the resolution is a pure function of the env, stable
-# across processes).
+# _merge_probe_into_yaml makedirs the dir on demand before the atomic
+# mkstemp, so a fresh host writes into whichever dir resolution lands on;
+# the next session reads the same dir (the resolution is a pure function of
+# the env, stable across processes).
 _IS_WINDOWS = _platform.system() == "Windows"
 
 
@@ -75,17 +78,19 @@ def _resolve_env_brief_path() -> str:
         shared = _shared_root_for_profile_home(home_hermes)
         if shared is not None:
             return str(shared / "env-brief.yaml")
-    # 2. ~/.hermes
-    candidates = [pathlib.Path.home() / ".hermes" / "env-brief.yaml"]
-    # 3. Windows APPDATA fallback
+    # 2. ~/.hermes, when that dir already exists (the normal case under a
+    #    live hermes runtime, which creates HERMES_HOME at boot).
+    home_dir = pathlib.Path.home() / ".hermes"
+    if home_dir.exists():
+        return str(home_dir / "env-brief.yaml")
+    # 3. Windows APPDATA fallback (%APPDATA%/hermes - the dir the old
+    #    hardcoded path pointed at), even if the `hermes` subdir does not
+    #    exist yet: _merge_probe_into_yaml makedirs it on the first write.
     if _IS_WINDOWS:
         appdata = _os.environ.get("APPDATA", "").strip()
         if appdata:
-            candidates.append(pathlib.Path(appdata) / "hermes" / "env-brief.yaml")
-    for c in candidates:
-        if c.parent.exists():
-            return str(c)
-    return str(candidates[0])
+            return str(pathlib.Path(appdata) / "hermes" / "env-brief.yaml")
+    return str(home_dir / "env-brief.yaml")
 
 
 _ENV_BRIEF_PATH = _resolve_env_brief_path()
@@ -154,11 +159,6 @@ def _env_time(_args) -> dict:
 #   field (cpu/memory/disk/permissions etc.) only fills in when missing/empty
 #   and never clobbers an existing value.
 # ---------------------------------------------------------------------------
-import os as _os
-import platform as _platform
-import subprocess
-import tempfile
-
 _TRIGGER_FIELDS = ("host", "os", "arch")
 
 def _probe_machine_linux() -> dict:
@@ -266,14 +266,18 @@ def _probe_machine() -> dict:
     return _probe_machine_linux()
 
 
-def _trigger_probe(existing: dict) -> bool:
+def _trigger_probe(existing: dict, live: dict | None = None) -> bool:
     """True if a re-probe is warranted: any trigger field missing/empty, or
     present but not matching the live machine (covers the 'stale yaml copied
-    across hosts' case, not just 'field deleted by hand')."""
+    across hosts' case, not just 'field deleted by hand'). `live` may be
+    supplied by the caller so the session-start hook pays for ONE probe,
+    not two (the old code probed once in the trigger check and again in
+    the merge)."""
     for k in _TRIGGER_FIELDS:
         if not existing.get(k):
             return True
-    live = _probe_machine()
+    if live is None:
+        live = _probe_machine()
     return any(existing.get(k) != live.get(k) for k in _TRIGGER_FIELDS)
 
 
@@ -310,9 +314,12 @@ _FIXED_HEADER = (
 def _leading_comment_block(path: str) -> str:
     """Leading pure-comment/blank lines of the file, verbatim. yaml.safe_dump
     drops YAML comments (they are not data) on any rewrite, so this is the
-    only way to keep hand-written header notes alive across a merge. Returns
-    the fixed header when the file does not yet exist (e.g. first-run delete
-    + reprobe flow, owner ruling 2026-11-12: no manual fields at all)."""
+    only way to keep hand-written header notes alive across a merge.
+    - file missing -> the fixed header (first-run delete + reprobe flow,
+      owner ruling 2026-11-12: no manual fields at all);
+    - file exists but has NO leading comment/blank block -> "" (we never
+      inject the fixed header into a header-less file: that would be a
+      silent byte change for no reason, breaking the prefix-cache rule)."""
     if not _os.path.exists(path):
         return _FIXED_HEADER
     with open(path, encoding="utf-8-sig") as f:
@@ -324,10 +331,20 @@ def _leading_comment_block(path: str) -> str:
             block.append(line.rstrip("\n"))
         else:
             break
-    return "\n".join(block) if block else _FIXED_HEADER
+    return "\n".join(block)
 
 
-def _merge_probe_into_yaml(path: str) -> None:
+def _lock_path_for(path: str) -> str:
+    """Shared sentinel file every writer serializes on: the sibling
+    '<data>.lock' of the data file. Deliberately NOT the per-writer temp
+    file (C2, 2026-11-18): locking a private temp file excludes nobody -
+    two gateway processes each locked their own brand-new file and still
+    raced the read-modify-write; only os.replace's atomicity was actually
+    protecting readers."""
+    return path + ".lock"
+
+
+def _merge_probe_into_yaml(path: str, probe: dict | None = None) -> None:
     """Two-tier write (owner ruling 2026-11-12: trigger fields have NO manual
     override - live value wins; everything else is fill-only):
     - host/os/arch: ALWAYS overwrite with the live probe value when it differs.
@@ -335,84 +352,100 @@ def _merge_probe_into_yaml(path: str) -> None:
     - the file's leading comment/blank block is preserved verbatim across the
       rewrite (yaml.safe_dump alone would drop it - see
       ``_leading_comment_block``).
-    Atomic write (temp file + os.replace) under an exclusive lock so two
-    multiplexed gateway processes racing the same session start cannot
-    interleave a half-written file. Lock primitive is platform-adaptive:
-    fcntl.flock on POSIX, msvcrt.locking on Windows (the same dual-primitive
-    pattern the code_map plugin uses for its cross-process locks)."""
+    Concurrency (2026-11-18 rewrite): the WHOLE read-modify-write is
+    serialized on the shared sentinel lock (_lock_path_for), so two
+    multiplexed gateway processes racing the same session start cannot lose
+    each other's updates. The atomic temp-file + os.replace write is kept as
+    the torn-file backstop for readers that read without the lock.
+    `probe` may be supplied by the caller (the session-start hook computes it
+    once for the trigger check AND the merge - was two full probes)."""
     import yaml
 
-    header = _leading_comment_block(path)
+    if probe is None:
+        probe = _probe_machine()
 
-    existing: dict = {}
-    if _os.path.exists(path):
-        try:
-            with open(path, encoding="utf-8-sig") as f:
-                loaded = yaml.safe_load(f)
-            if isinstance(loaded, dict):
-                existing = loaded
-        except Exception:
-            existing = {}  # unreadable/corrupt file: rebuild from probe, keep nothing
-
-    probe = _probe_machine()
-    merged = dict(existing)
-    changed = False
-
-    # Tier 1: trigger fields - live value always wins when it differs
-    for k in _TRIGGER_FIELDS:
-        if k in probe and merged.get(k) != probe[k]:
-            merged[k] = probe[k]
-            changed = True
-
-    # Tier 2: everything else - fill only if missing/empty
-    for k, v in probe.items():
-        if k in _TRIGGER_FIELDS:
-            continue
-        if not merged.get(k):
-            merged[k] = v
-            changed = True
-
-    # Generated field (owner ruling 2026-11-12: no hand-written fields at all):
-    # user_timezone_hint is derived from the two probed timezone fields,
-    # regenerated whenever either changes so it can never go stale vs the
-    # machine it describes.
-    hint = _derive_timezone_hint(merged)
-    if hint and merged.get("user_timezone_hint") != hint:
-        merged["user_timezone_hint"] = hint
-        changed = True
-
-    if not changed:
-        return
-
-    fd, tmp = tempfile.mkstemp(dir=_os.path.dirname(path) or ".", suffix=".yaml.tmp")
+    handle = _acquire_shared_lock(_lock_path_for(path))
     try:
-        with _os.fdopen(fd, "w") as f:
-            _exclusive_lock(f)
-            dumped = yaml.safe_dump(merged, allow_unicode=True, sort_keys=False)
-            if header:
-                f.write(header + "\n\n")
-            f.write(dumped)
-            _exclusive_unlock(f)  # msvcrt requires explicit unlock; no-op on POSIX
-        _os.replace(tmp, path)
-    except BaseException:
-        if _os.path.exists(tmp):
-            _os.remove(tmp)
-        raise
+        header = _leading_comment_block(path)
+
+        existing: dict = {}
+        if _os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8-sig") as f:
+                    loaded = yaml.safe_load(f)
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except Exception:
+                existing = {}  # unreadable/corrupt file: rebuild from probe, keep nothing
+
+        merged = dict(existing)
+        changed = False
+
+        # Tier 1: trigger fields - live value always wins when it differs
+        for k in _TRIGGER_FIELDS:
+            if k in probe and merged.get(k) != probe[k]:
+                merged[k] = probe[k]
+                changed = True
+
+        # Tier 2: everything else - fill only if missing/empty
+        for k, v in probe.items():
+            if k in _TRIGGER_FIELDS:
+                continue
+            if not merged.get(k):
+                merged[k] = v
+                changed = True
+
+        # Generated field (owner ruling 2026-11-12: no hand-written fields
+        # at all): user_timezone_hint is derived from the two probed
+        # timezone fields, regenerated whenever it differs so it can never
+        # go stale vs the machine it describes.
+        hint = _derive_timezone_hint(merged)
+        if hint and merged.get("user_timezone_hint") != hint:
+            merged["user_timezone_hint"] = hint
+            changed = True
+
+        if not changed:
+            return
+
+        # M3: a fresh host's resolved dir may not exist yet; create it so
+        # the atomic write can land (the old code relied on mkstemp, which
+        # raises FileNotFoundError on a missing dir - silently swallowed by
+        # the hook, placeholder forever).
+        dirname = _os.path.dirname(path) or "."
+        _os.makedirs(dirname, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=dirname, suffix=".yaml.tmp")
+        try:
+            with _os.fdopen(fd, "w", encoding="utf-8") as f:
+                if header:
+                    f.write(header + "\n\n")
+                f.write(yaml.safe_dump(merged, allow_unicode=True, sort_keys=False))
+            _os.replace(tmp, path)
+        except BaseException:
+            if _os.path.exists(tmp):
+                _os.remove(tmp)
+            raise
+    finally:
+        _release_shared_lock(handle)
 
 
-def _exclusive_lock(f) -> None:
-    """Platform-adaptive exclusive lock on an open file handle: fcntl.flock on
-    POSIX, msvcrt.locking on Windows. The lock is held for the duration of
-    the with-block; released by the caller's fd close (flock is released on
-    close; msvcrt.locking is released explicitly in the same with-block via
-    the paired _exclusive_unlock). Fail-soft: if neither primitive is
-    importable (exotic host), degrade to a no-op with a warning (the content
-    merge gate remains the backstop, same discipline as code_map's
-    _shard_lock)."""
+def _acquire_shared_lock(lock_path: str):
+    """Cross-process exclusive lock on the SHARED sentinel file (see
+    _lock_path_for), held for the whole read-modify-write.
+    Primitives: fcntl.flock (POSIX - released on close) / msvcrt.locking
+    byte 0 (Windows - explicit unlock before close). The sentinel is opened
+    'a+b' (create-if-missing, NEVER truncate), so two racers create the
+    same file and contend on it. The msvcrt branch reserves a 1-byte anchor
+    on a 0-byte file in BINARY mode so the lock has a byte range to hold -
+    the old C1 bug wrote that anchor as BYTES into a TEXT-mode handle
+    (hard TypeError, merge dead on Windows) and the anchor was superseded
+    by the dump anyway.
+    Fail-soft: if neither primitive is importable (exotic host), degrade to
+    an unlocked write with a warning - os.replace atomicity is the
+    torn-file backstop (same discipline as code_map's _shard_lock)."""
     global _LOCK_KIND
     if _LOCK_KIND is None:
         try:
-            import fcntl
+            import fcntl  # noqa: F401
             _LOCK_KIND = "fcntl"
         except Exception:
             try:
@@ -421,38 +454,39 @@ def _exclusive_lock(f) -> None:
             except Exception:
                 _LOCK_KIND = "none"
                 logger.warning("env-brief: no cross-process lock primitive "
-                               "(fcntl/msvcrt) - relying on the in-process "
-                               "merge gate only")
+                               "(fcntl/msvcrt) - relying on the atomic "
+                               "replace only")
+                return None
+    parent = _os.path.dirname(lock_path) or "."
+    _os.makedirs(parent, exist_ok=True)
+    handle = open(lock_path, "a+b")
     if _LOCK_KIND == "fcntl":
         import fcntl
-        fcntl.flock(f, fcntl.LOCK_EX)
-    elif _LOCK_KIND == "msvcrt":
+        fcntl.flock(handle, fcntl.LOCK_EX)
+    else:  # msvcrt
         import msvcrt
-        # Windows locking() reserves a byte-range; reserve byte 0 on an empty
-        # temp file (the file is 0 bytes at mkstemp time, so byte 0 is a
-        # valid 1-byte reservation that no other writer can hold).
-        f.seek(0)
-        # Ensure at least 1 byte exists so the lock has a range to reserve.
-        # The temp file is written AFTER the lock is acquired (the dump below),
-        # so at this point it is still 0 bytes; write a single NUL as the
-        # lock anchor, then truncate back to 0 before the real dump so the
-        # final file has no stray NUL.
-        f.write(b"\0")
-        f.flush()
-        f.seek(0)
-        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        handle.seek(0)
+        if _os.fstat(handle.fileno()).st_size == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    return handle
 
 
-def _exclusive_unlock(f) -> None:
-    """Release the platform-adaptive lock taken by _exclusive_lock. msvcrt
-    requires an explicit unlock (LK_UNLCK) on the same byte-range; fcntl
-    releases on close so this is a no-op on POSIX."""
+def _release_shared_lock(handle) -> None:
+    """Release the shared lock: explicit LK_UNLCK on the same byte range
+    (msvcrt), then close (flock releases on close). No-op when the
+    primitive degraded to 'none' (handle is None)."""
+    if handle is None:
+        return
     if _LOCK_KIND == "msvcrt":
         import msvcrt
         try:
-            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         except Exception:
             pass  # already released / fd closed
+    handle.close()
 
 
 _LOCK_KIND: str | None = None
@@ -504,10 +538,18 @@ def register(ctx) -> None:
                     loaded = yaml.safe_load(f)
                 if isinstance(loaded, dict):
                     existing = loaded
-            if _trigger_probe(existing):
-                _merge_probe_into_yaml(_ENV_BRIEF_PATH)
+            # Probe ONCE and reuse the result for the trigger check and the
+            # merge (the old path probed up to twice per session start).
+            missing = not all(existing.get(k) for k in _TRIGGER_FIELDS)
+            live = None if missing else _probe_machine()
+            if missing or _trigger_probe(existing, live):
+                _merge_probe_into_yaml(_ENV_BRIEF_PATH, probe=live)
                 logger.info("env-brief on_session_start: probe+merge updated %s", _ENV_BRIEF_PATH)
         except Exception:
-            pass
+            # Fail-open: never break the session - but log it. The bare
+            # `pass` here is what hid the C1 TypeError on Windows for a
+            # week; a swallowed exception must stay observable.
+            logger.warning("env-brief on_session_start probe+merge failed",
+                           exc_info=True)
 
     ctx.register_hook("on_session_start", _on_session_start)
