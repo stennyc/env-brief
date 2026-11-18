@@ -18,6 +18,10 @@ bash ~/.hermes/plugins/env-brief/install.sh --all-profiles
 
 ```powershell
 git clone https://github.com/stennyc/env-brief.git "C:\Users\$env:USERNAME\AppData\Local\hermes\plugins\env-brief"
+# -AllProfiles: link EVERY profile, skipping the config.yaml gate (a link
+# is inert unless that profile's config enables env-brief - see "Enable in
+# profile config" below). Drop the flag to only link profiles already
+# carrying `- env-brief` in their config.yaml.
 & "C:\Users\$env:USERNAME\AppData\Local\hermes\plugins\env-brief\install.ps1" -AllProfiles
 ```
 

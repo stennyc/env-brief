@@ -7,8 +7,14 @@
 #
 # Platforms:
 #   Linux:  $HERMES_HOME/plugins/env-brief  (default: ~/.hermes/plugins/env-brief)
-#   Windows: C:/Users/<user>/AppData/Local/hermes/plugins/env-brief
-#            AND  ~/.hermes/plugins/env-brief  (dual-install)
+#   Windows (git-bash/MSYS): dual-install -
+#            C:/Users/<user>/.hermes/plugins/env-brief   (MSYS $HOME, the
+#            unix-side shared root) AND
+#            C:/Users/<user>/AppData/Local/hermes/plugins/env-brief
+#            NOTE: on Windows $HERMES_HOME points at a PROFILE home
+#            (AppData/Local/hermes/profiles/<p>) - installing there would
+#            create a third profile-local copy, so the unix-side target
+#            is MSYS $HOME/.hermes instead (rescan 2026-11-18, P3).
 set -euo pipefail
 
 DRY_RUN=false
@@ -46,10 +52,21 @@ install_to() {
   echo "  [ok] $label: $dest"
 }
 
+# Target layout: on the unix side the shared root is $HERMES_HOME (Linux)
+# OR MSYS $HOME/.hermes (Windows git-bash - $HERMES_HOME is a PROFILE
+# home there; see the header note). The windows side (AppData) is the
+# second target.
+if [ -n "$PLUGINS_DIR_WIN" ]; then
+  TARGET1="$HOME/.hermes/plugins/$PLUGIN_NAME"
+else
+  TARGET1="$HERMES_HOME/plugins/$PLUGIN_NAME"
+fi
+TARGET2="${PLUGINS_DIR_WIN:+$PLUGINS_DIR_WIN/$PLUGIN_NAME}"
+
 echo "=== env-brief installer ==="
 echo "[1/3] Installing plugin source..."
-install_to "$HERMES_HOME/plugins/$PLUGIN_NAME" "linux ($HERMES_HOME)"
-[ -n "$PLUGINS_DIR_WIN" ] && install_to "$PLUGINS_DIR_WIN/$PLUGIN_NAME" "windows (AppData)"
+install_to "$TARGET1" "unix ($TARGET1)"
+[ -n "$TARGET2" ] && install_to "$TARGET2" "windows (AppData)"
 
 echo "[2/3] Setting up profile symlinks..."
 if [ -n "$PLUGINS_DIR_WIN" ]; then
@@ -105,7 +122,7 @@ fi
 
 echo "[3/3] Verification..."
 count=0
-for d in "$HERMES_HOME/plugins/$PLUGIN_NAME" "${PLUGINS_DIR_WIN:+$PLUGINS_DIR_WIN/$PLUGIN_NAME}"; do
+for d in "$TARGET1" "${PLUGINS_DIR_WIN:+$PLUGINS_DIR_WIN/$PLUGIN_NAME}"; do
   [ -n "$d" ] && [ -f "$d/__init__.py" ] && count=$((count+1))
 done
 echo "  installed to $count location(s)"

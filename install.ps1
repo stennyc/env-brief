@@ -3,6 +3,8 @@
 #
 # Usage:
 #   .\install.ps1 [-Profile <name>] [-AllProfiles] [-DryRun]
+#       -AllProfiles: link EVERY profile, skipping the config.yaml gate
+#       (a link is inert unless that profile's config enables env-brief)
 #
 # Dual install paths:
 #   1. C:\Users\<user>\AppData\Local\hermes\plugins\env-brief\
@@ -62,7 +64,11 @@ foreach ($prof in $AllProfs) {
     if (Test-Path $cfg) {
         $has = (Get-Content $cfg -Raw) -match '-\s*env-brief\s*$'
     }
-    if (-not $has) { continue }
+    # -AllProfiles (rescan 2026-11-18 P3: was a dead switch that did
+    # nothing different from a full scan): skip the config.yaml gate and
+    # link EVERY profile. A link is inert unless the profile's config
+    # enables env-brief, so this just saves the per-profile hand-edit.
+    if (-not $has -and -not $AllProfiles) { continue }
     $link = Join-Path "$ProfilesBase\profiles\$prof\plugins" $PluginName
     $src  = Join-Path $WinPlugins $PluginName
     if ($DryRun) {
