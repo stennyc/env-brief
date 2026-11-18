@@ -219,6 +219,83 @@ def test_shared_lock_roundtrip(eb, tmp_path):
         eb._release_shared_lock(handle)
 
 
+def test_msvcrt_lock_polling_waits_out_holder(eb, tmp_path):
+    """P1 regression (fast form): a 3s holder must be waited out by the
+    NBLCK-polling acquire (it WAS, pre-P1-fix, just a blocking LK_LOCK
+    wait - this pins the polling path itself: acquire must block until
+    the holder releases, not fail fast)."""
+    if not _IS_WINDOWS:
+        pytest.skip("msvcrt path - windows only")
+    import subprocess as _sp
+    import sys as _sys
+    import textwrap
+    import time
+
+    lock = str(tmp_path / "poll.lock")
+    holder = textwrap.dedent(
+        f"""
+        import importlib.util, time
+        spec = importlib.util.spec_from_file_location("eb_holder",
+            r"{_PLUGIN_ROOT / '__init__.py'!s}")
+        m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+        h = m._acquire_shared_lock(r"{lock}")
+        time.sleep(3)
+        m._release_shared_lock(h)
+        print("holder done", flush=True)
+        """)
+    p = _sp.Popen([_sys.executable, "-c", holder],
+                  stdout=_sp.PIPE, text=True)
+    time.sleep(1.0)  # let the holder grab the lock first
+    t0 = time.monotonic()
+    h = eb._acquire_shared_lock(lock)
+    waited = time.monotonic() - t0
+    eb._release_shared_lock(h)
+    p.wait(timeout=30)
+    # holder releases ~2s after our attempt began; the acquire must have
+    # waited for it (proving exclusion + polling, not fail-fast).
+    assert 1.5 <= waited <= 6.0, f"acquire waited {waited:.2f}s"
+
+
+@pytest.mark.skipif(not os.environ.get("ENVBRIEF_SLOW_TESTS"),
+                    reason="opt-in ~15s test: ENVBRIEF_SLOW_TESTS=1")
+def test_msvcrt_lock_survives_above_edeadlk_window(eb, tmp_path):
+    """P1 regression (slow, opt-in): the 13s holder is > Windows' ~9s
+    EDEADLK window that KILLED the old blocking LK_LOCK request. The
+    polling acquire must still wait the holder out (~12s) instead of
+    failing. Run: ENVBRIEF_SLOW_TESTS=1 python -m pytest -k edeadlk."""
+    if not _IS_WINDOWS:
+        pytest.skip("msvcrt path - windows only")
+    import subprocess as _sp
+    import sys as _sys
+    import textwrap
+    import time
+
+    lock = str(tmp_path / "slow.lock")
+    holder = textwrap.dedent(
+        f"""
+        import importlib.util, time
+        spec = importlib.util.spec_from_file_location("eb_holder2",
+            r"{_PLUGIN_ROOT / '__init__.py'!s}")
+        m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+        h = m._acquire_shared_lock(r"{lock}")
+        time.sleep(13)
+        m._release_shared_lock(h)
+        """)
+    p = _sp.Popen([_sys.executable, "-c", holder],
+                  stdout=_sp.PIPE, text=True)
+    time.sleep(1.0)
+    t0 = time.monotonic()
+    h = eb._acquire_shared_lock(lock)
+    waited = time.monotonic() - t0
+    eb._release_shared_lock(h)
+    p.wait(timeout=30)
+    # 13s holder, we started ~1s in: must wait ~12s, well past the old
+    # 9.3s EDEADLK kill point - the pre-P1-fix code failed here at 9.3s.
+    assert 10.0 <= waited <= 18.0, (
+        f"polling acquire waited {waited:.2f}s; the old blocking request "
+        f"would have failed at ~9.3s with EDEADLK")
+
+
 # ---------------------------------------------------------------------------
 # L2/L3: Windows probe shape (batched powershell+python, no net session)
 # ---------------------------------------------------------------------------

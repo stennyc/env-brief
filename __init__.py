@@ -545,17 +545,31 @@ def _merge_probe_into_yaml(path: str, probe: dict | None = None) -> None:
 def _acquire_shared_lock(lock_path: str):
     """Cross-process exclusive lock on the SHARED sentinel file (see
     _lock_path_for), held for the whole read-modify-write.
-    Primitives: fcntl.flock (POSIX - released on close) / msvcrt.locking
-    byte 0 (Windows - explicit unlock before close). The sentinel is opened
+    Primitives: fcntl.flock (POSIX - released on close, no waiting
+    limit) / msvcrt byte-0 locking on Windows. The sentinel is opened
     'a+b' (create-if-missing, NEVER truncate), so two racers create the
-    same file and contend on it. The msvcrt branch reserves a 1-byte anchor
-    on a 0-byte file in BINARY mode so the lock has a byte range to hold -
-    the old C1 bug wrote that anchor as BYTES into a TEXT-mode handle
-    (hard TypeError, merge dead on Windows) and the anchor was superseded
-    by the dump anyway.
-    Fail-soft: if neither primitive is importable (exotic host), degrade to
-    an unlocked write with a warning - os.replace atomicity is the
-    torn-file backstop (same discipline as code_map's _shard_lock)."""
+    same file and contend on it. The msvcrt branch writes a 1-byte
+    anchor on a 0-byte file in BINARY mode so the lock has a byte range
+    to reserve - the old C1 bug wrote that anchor as BYTES into a
+    TEXT-mode handle (hard TypeError, merge dead on Windows) and the
+    anchor was superseded by the dump anyway.
+
+    P1 (rescan 2026-11-18, measured on this host): a BLOCKING
+    msvcrt.locking LK_LOCK request is aborted by the OS at ~9s with
+    EDEADLK ([Errno 36] 'Resource deadlock avoided') - verified: a
+    13s holder made the second writer's blocking request fail at
+    9.3s, while a 3s holder was waited out fine. The consequence:
+    'cannot lose each other's updates' only held for <=~9s contention
+    (a slow-disk / AV-scan / network-drive wedge silently un-serialized
+    the second writer, which then raced the read-modify-write). The
+    msvcrt branch therefore POLLS NON-blocking LK_NBLCK requests
+    (0.2s backoff, 30s deadline) instead of one blocking request: a
+    wedged holder past the deadline loses to the next session start
+    (the hook is fail-open and logs it) rather than racing unlocked.
+    Fail-soft: if neither primitive is importable (exotic host),
+    degrade to an unlocked write with a warning - os.replace atomicity
+    is the torn-file backstop (same discipline as code_map's
+    _shard_lock)."""
     global _LOCK_KIND
     if _LOCK_KIND is None:
         try:
@@ -579,12 +593,24 @@ def _acquire_shared_lock(lock_path: str):
         fcntl.flock(handle, fcntl.LOCK_EX)
     else:  # msvcrt
         import msvcrt
+        import time
         handle.seek(0)
         if _os.fstat(handle.fileno()).st_size == 0:
             handle.write(b"\0")
             handle.flush()
         handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        # P1: poll NON-blocking requests - a blocking LK_LOCK dies at the
+        # OS's ~9s EDEADLK watchdog (see docstring); NBLCK + backoff has
+        # no such limit and keeps the serialization guarantee.
+        deadline = time.monotonic() + 30.0
+        while True:
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.2)
     return handle
 
 
