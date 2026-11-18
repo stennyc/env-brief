@@ -509,3 +509,54 @@ def test_posix_probe_parallel_cap(eb, monkeypatch):
     assert data.get("c") in (None, "")    # 8s probe cut at its 5s timeout
     assert "late" not in str(data)
     assert elapsed < 20                   # under the hard wall-clock cap
+
+
+def test_win_tz_map_unifies_iana(eb, monkeypatch):
+    """F2 (rescan P2-3): known Windows tz ids unify to IANA names at
+    new-fill time (fill-only keeps existing values; unmapped ids keep the
+    native name). Powershell stdout is faked; the py probe runs for real
+    (it never writes timezone_ianna, so the mapped value survives)."""
+    if not sys.platform.startswith("win"):
+        pytest.skip("windows only")
+    assert eb._WIN_TZ_TO_IANA.get(
+        "Malay Peninsula Standard Time") == "Asia/Kuala_Lumpur"
+    assert eb._WIN_TZ_TO_IANA.get(
+        "Singapore Standard Time") == "Asia/Singapore"
+    assert eb._WIN_TZ_TO_IANA.get("Foo Standard Time", "Fallback Id") == \
+        "Fallback Id"  # unmapped -> native name kept
+
+    class FakeRes:
+        returncode = 0
+        stdout = "False|Malay Peninsula Standard Time"
+    real_run = eb.subprocess.run
+
+    def fake_run(cmd, *a, **k):
+        # the powershell probe's cmd is ["powershell", "-NoProfile", ...]
+        if str(cmd[0]).lower() == "powershell":
+            return FakeRes()
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(eb.subprocess, "run", fake_run)
+    data = eb._probe_machine_windows()
+    assert data.get("timezone_ianna") == "Asia/Kuala_Lumpur"
+
+
+def test_win_py_probe_failure_is_logged(eb, monkeypatch, caplog):
+    """P3 (rescan): a wedged live-python probe (e.g. PyInstaller-frozen
+    exe without -c support) drops tz/cpu/disk/mem fail-open - now with a
+    warning instead of a bare `pass`."""
+    import logging
+    if not sys.platform.startswith("win"):
+        pytest.skip("windows only")
+    real_run = eb.subprocess.run
+
+    def fake_run(cmd, *a, **k):
+        if "-c" in cmd:
+            raise FileNotFoundError(cmd[0])
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(eb.subprocess, "run", fake_run)
+    with caplog.at_level(logging.WARNING, logger="env-brief"):
+        data = eb._probe_machine_windows()
+    assert "memory_total" not in data       # dropped, fail-open
+    assert any("live-python probe failed" in r.message for r in caplog.records)

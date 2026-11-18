@@ -300,6 +300,20 @@ def _probe_machine_posix() -> dict:
     return data
 
 
+# Windows tz id -> IANA name (compact, verified entries; extend lazily).
+# Rescan P2-3 (2026-11-18): powershell reports a Windows tz id while a
+# python probe on the same field would report a different non-IANA name -
+# two values for one field. The map unifies them at NEW-fill time: fill-
+# only means an existing file value is NEVER clobbered, and unmapped ids
+# keep the OS-native name (the hint layer renders either fine). Verified
+# on this host 2026-11-18: both ids are +0800 zones and zoneinfo accepts
+# the mapped IANA names.
+_WIN_TZ_TO_IANA = {
+    "Singapore Standard Time": "Asia/Singapore",
+    "Malay Peninsula Standard Time": "Asia/Kuala_Lumpur",
+}
+
+
 def _probe_machine_windows() -> dict:
     """Windows probes (the discarded 2bc7d36 'Windows compatibility' branch,
     generalized — no hardcoded C:\\Users\\user). host/os/arch are always
@@ -335,9 +349,11 @@ def _probe_machine_windows() -> dict:
     # fact, so it is intentionally not probed.
     data["shell"] = _os.environ.get("COMSPEC", "").strip() or "cmd.exe"
     data["sudo_available"] = "false"  # no sudo on Windows
-    # home_writable: USERPROFILE is the Windows home
+    # home_writable: USERPROFILE is the Windows home. Existence/isdir is
+    # NOT proof of writability (rescan P3) - use access() to match the
+    # POSIX probe's `test -w "$HOME"` semantics.
     home = _os.environ.get("USERPROFILE", "").strip()
-    data["home_writable"] = "true" if home and _os.path.isdir(home) else "false"
+    data["home_writable"] = "true" if (home and _os.access(home, _os.W_OK)) else "false"
 
     # One powershell call -> "False|Malay Peninsula Standard Time"
     try:
@@ -351,7 +367,10 @@ def _probe_machine_windows() -> dict:
         left, _, right = out.stdout.partition("|")
         data["user_is_root"] = "true" if left.strip().lower() == "true" else "false"
         if right.strip():
-            data["timezone_ianna"] = right.strip()
+            # Rescan P2-3: unify a known Windows tz id to its IANA name at
+            # new-fill time (fill-only: an existing file value is kept);
+            # an unmapped id keeps the native name.
+            data["timezone_ianna"] = _WIN_TZ_TO_IANA.get(right.strip(), right.strip())
     except Exception:
         data["user_is_root"] = "false"  # fail-soft: non-admin is the safe default
 
@@ -395,8 +414,13 @@ def _probe_machine_windows() -> dict:
             data["disk_root_avail"] = lines[2]
         if len(lines) > 3 and lines[3]:
             data["memory_total"] = lines[3]
-    except Exception:
-        pass
+    except Exception as e:
+        # Fail-open: tz/cpu/disk/mem simply don't get filled this session
+        # (the powershell probe already covered user + ianna); log it so a
+        # wedged interpreter is observable instead of a silent 4-fact gap.
+        logger.warning(
+            "env-brief: live-python probe failed (%s) - tz/cpu/disk/mem "
+            "facts not filled this session", e)
     # L1: drop empty values - `user: ""` must never leak into the yaml.
     return {k: v for k, v in data.items() if v not in ("", None)}
 
