@@ -24,8 +24,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-HERMES_HOME="${{HERMES_HOME:-$HOME/.hermes}}"
-SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_NAME="env-brief"
 
 if command -v cygpath >/dev/null 2>&1; then
@@ -34,7 +34,7 @@ else
   PLUGINS_DIR_WIN=""
 fi
 
-install_to() {{
+install_to() {
   local dest="$1" label="$2"
   if [ "$DRY_RUN" = true ]; then
     echo "  [dry-run] would install env-brief to $label: $dest"
@@ -44,7 +44,7 @@ install_to() {{
   cp -r "$SCRIPT_DIR/"* "$dest/" 2>/dev/null || true
   [ -d "$SCRIPT_DIR/.git" ] && [ ! -d "$dest/.git" ] && cp -r "$SCRIPT_DIR/.git" "$dest/"
   echo "  [ok] $label: $dest"
-}}
+}
 
 echo "=== env-brief installer ==="
 echo "[1/3] Installing plugin source..."
@@ -61,9 +61,10 @@ fi
 if [ -d "$PROFILES_DIR" ]; then
   if [ -n "$PROFILE" ]; then
     PROFILE_LIST=("$PROFILE")
-  elif [ "$ALL_PROFILES" = true ]; then
-    PROFILE_LIST=($(ls "$PROFILES_DIR"))
   else
+    # default (and --all-profiles, which means the same thing here): every
+    # profile dir, via a glob loop - NOT `ls` word-splitting, which breaks
+    # on profile names with spaces.
     PROFILE_LIST=()
     for d in "$PROFILES_DIR"/*/; do
       [ -d "$d" ] || continue
@@ -72,21 +73,31 @@ if [ -d "$PROFILES_DIR" ]; then
     done
   fi
 
-  for prof in "${{PROFILE_LIST[@]}}"; do
+  for prof in "${PROFILE_LIST[@]}"; do
     cfg="$PROFILES_DIR/$prof/config.yaml"
     has=false
     [ -f "$cfg" ] && grep -qE '^\s*-\s*env-brief\s*$' "$cfg" 2>/dev/null && has=true
     if [ "$has" = true ]; then
       link="$PROFILES_DIR/$prof/plugins/$PLUGIN_NAME"
-      src="$PLUGINS_DIR_WIN/$PLUGIN_NAME" 2>/dev/null || src="$HERMES_HOME/plugins/$PLUGIN_NAME"
       [ -f "$link" ] && rm -f "$link"
       [ -d "$link" ] && rm -rf "$link"
+      if [ -n "$PLUGINS_DIR_WIN" ]; then
+        src="$PLUGINS_DIR_WIN/$PLUGIN_NAME"
+      else
+        src="$HERMES_HOME/plugins/$PLUGIN_NAME"
+      fi
       if [ "$DRY_RUN" = true ]; then
         echo "  [dry-run] symlink $link -> $src"
       else
         [ -n "$PLUGINS_DIR_WIN" ] && src="$(cygpath -m "$src")"
-        ln -s "$src" "$link"
-        echo "  [ok] $prof/plugins/$PLUGIN_NAME -> $src"
+        # ln -s needs Developer Mode / admin on Windows: degrade to a
+        # warning instead of dying under set -e (a half-finished install
+        # after [1/3] succeeded was worse than a completed one + warning).
+        if ! ln -s "$src" "$link"; then
+          echo "  [warn] symlink failed for $prof (needs Developer Mode/admin) - copy manually: $src -> $link"
+        else
+          echo "  [ok] $prof/plugins/$PLUGIN_NAME -> $src"
+        fi
       fi
     fi
   done
@@ -94,7 +105,7 @@ fi
 
 echo "[3/3] Verification..."
 count=0
-for d in "$HERMES_HOME/plugins/$PLUGIN_NAME" "${{PLUGINS_DIR_WIN:+$PLUGINS_DIR_WIN/$PLUGIN_NAME}}"; do
+for d in "$HERMES_HOME/plugins/$PLUGIN_NAME" "${PLUGINS_DIR_WIN:+$PLUGINS_DIR_WIN/$PLUGIN_NAME}"; do
   [ -n "$d" ] && [ -f "$d/__init__.py" ] && count=$((count+1))
 done
 echo "  installed to $count location(s)"
