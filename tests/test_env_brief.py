@@ -487,3 +487,25 @@ def test_live_data_file_renders_no_placeholder(eb):
     if not os.path.exists(eb._ENV_BRIEF_PATH):
         pytest.skip("no live data file on this host")
     assert "host facts unavailable" not in eb._render_brief()
+
+
+def test_posix_probe_parallel_cap(eb, monkeypatch):
+    """E1 (rescan P2-2): probes run concurrently under the 20s wall cap -
+    a probe that hangs past its 5s per-call timeout is dropped while the
+    fast ones land, and total wall time stays far below the old serial
+    worst case (13 probes x 10s ~= 135s)."""
+    import time
+    if not shutil.which("sh"):
+        pytest.skip("needs sh (git-bash on Windows is fine)")
+    fast = ["sh", "-c", "echo ok"]
+    slow = ["sh", "-c", "sleep 8; echo late"]
+    monkeypatch.setattr(eb, "_POSIX_PROBES",
+                        {"a": fast, "b": fast, "c": slow})
+    t0 = time.monotonic()
+    data = eb._probe_machine_posix()
+    elapsed = time.monotonic() - t0
+    assert data.get("a") == "ok"          # fast probes land
+    assert data.get("b") == "ok"
+    assert data.get("c") in (None, "")    # 8s probe cut at its 5s timeout
+    assert "late" not in str(data)
+    assert elapsed < 20                   # under the hard wall-clock cap

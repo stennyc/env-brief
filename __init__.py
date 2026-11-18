@@ -253,29 +253,50 @@ _POSIX_PROBES: dict = {
 }
 
 
-def _probe_machine_posix() -> dict:
-    """POSIX probes (Linux + macOS): one subprocess per key in
-    _POSIX_PROBES, each fails open to a missing key (never a raise into the
-    hook). macOS fallbacks: cpu via sysctl/getconf, memory via hw.memsize,
-    login shell via dscl (getent/nproc/free are GNU-only); the IANA zone
-    falls back readlink -f -> readlink -> /etc/timezone across distros."""
-    data: dict = {}
-    for key, cmd in _POSIX_PROBES.items():
-        try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            val = out.stdout.strip()
-            if val:
-                data[key] = val
-        except Exception:
-            pass
+def _run_probe_cmd(key: str, cmd, timeout: int = 5):
+    """One probe in the pool: run `cmd` with a per-call timeout; returns
+    (key, value-or-'') — never raises (a failed probe just drops its key,
+    fail-open)."""
     try:
-        out = subprocess.run(
-            ["sh", "-c", "grep -oE 'container=.*' /run/.containerenv 2>/dev/null | head -1 | cut -d= -f2"],
-            capture_output=True, text=True, timeout=5)
-        if out.stdout.strip():
-            data["container"] = out.stdout.strip()
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        val = out.stdout.strip()
     except Exception:
-        pass
+        val = ""
+    return key, val
+
+
+_CONTAINER_PROBE_CMD = ["sh", "-c",
+                        "grep -oE 'container=.*' /run/.containerenv 2>/dev/null "
+                        "| head -1 | cut -d= -f2"]
+
+
+def _probe_machine_posix() -> dict:
+    """POSIX probes (Linux + macOS), run CONCURRENTLY (thread pool -
+    subprocess releases the GIL, so this is real parallelism) under a hard
+    20s wall-clock cap: the rescan (2026-11-18, P2-2) showed the serial
+    version could stall session start up to ~135s on a wedged host (13
+    probes x 10s timeout). Parallel + 5s per-call timeout + 20s deadline
+    bounds the worst case at ~20s; probes unfinished at the cap are
+    dropped fail-open (missing key -> merge fills from the file or skips;
+    no crash, no rewrite). macOS fallbacks: cpu via sysctl/getconf,
+    memory via hw.memsize, login shell via dscl (getent/nproc/free are
+    GNU-only); the IANA zone falls back readlink -f -> readlink ->
+    /etc/timezone across distros."""
+    import concurrent.futures
+    data: dict = {}
+    probes = dict(_POSIX_PROBES)
+    probes["container"] = _CONTAINER_PROBE_CMD
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(probes)) as pool:
+        futs = [pool.submit(_run_probe_cmd, k, cmd, 5) for k, cmd in probes.items()]
+        try:
+            for fut in concurrent.futures.as_completed(futs, timeout=20):
+                key, val = fut.result()
+                if val:
+                    data[key] = val
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                "env-brief: POSIX probe wall-clock cap (20s) hit; unfinished "
+                "probes dropped fail-open")
     return data
 
 
