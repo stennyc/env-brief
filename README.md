@@ -75,22 +75,22 @@ This is the "90% of the time on-demand is enough; the other 10% gets a real cloc
 
 ### Auto-probe + merge-back
 
-On every session start, env-brief probes the machine (one short subprocess per fact: `hostname`, `uname -sr`, `nproc`, `free -h`, `df -h`, login shell, `whoami`, timezone, root/sudo/home-writable checks, container detection) and merges the result into the YAML file:
+On every session start, env-brief probes the machine (ONCE — the result is reused by both the trigger check and the merge) and merges into the YAML file. The probe dispatches per OS: POSIX (Linux/macOS) runs one short subprocess per fact (`hostname`, `uname -s` (stable family name, never the kernel release), `nproc`/`sysctl`/`getconf`, `free -h`/`hw.memsize`, `df -h`, login shell via `getent`/`dscl`, `whoami`, timezone, root/sudo/home-writable checks, container detection); Windows batches into exactly two calls (one PowerShell: admin check + IANA timezone; one live-Python: UTC offset + CPU + disk + memory).
 
 - **Trigger fields** (`host`, `os`, `arch`) are **always overwritten** with the live value when it differs — no hand-written value survives a mismatch. This also catches the "I copied an old `env-brief.yaml` from another machine" case: if the live `host`/`os`/`arch` don't match the file, it's treated as stale and re-probed.
 - **All other fields** are **fill-only**: a missing/empty field gets probed; an existing field is never clobbered by the probe.
 - `user_timezone_hint` is **code-generated, never hand-typed**: it's derived from the probed `timezone` (numeric offset) + `timezone_ianna` (IANA name) pair, so it can't go stale relative to the machine it describes.
-- The write is **atomic** (`tempfile` + `os.replace`) under an **exclusive `fcntl.flock`**, so two multiplexed gateway processes racing the same session start can't interleave a half-written file.
+- The write is **atomic** (`tempfile` + `os.replace`), and the whole read-modify-write is serialized on a **shared sentinel lock** — `env-brief.yaml.lock`, a sibling of the data file (`fcntl.flock` on POSIX, `msvcrt.locking` on Windows) — so two multiplexed gateway processes racing the same session start cannot lose each other's updates.
 - The file's leading comment block (the header explaining what the file is) is preserved verbatim across every rewrite — `yaml.safe_dump` alone would drop it, so the plugin re-attaches it explicitly.
 - Probe scope is **machine/OS/hardware/permissions only** — deliberately no toolchain (no python path/version fields).
 
 ### Why "one file, shared by every profile"
 
-Under Hermes' default multiplexed gateway (`gateway.multiplex_profiles: true`), one gateway process serves many profiles, and **each profile has its own `HERMES_HOME`** (`~/.hermes/profiles/<name>`). A host fact like "this box is `hermes2`, 4 cores, 12 GiB, root, UTC+8" is a property of the *machine*, not of a profile — so the data file lives at an **absolute, profile-independent path** (default `~/.hermes/env-brief.yaml`, i.e. the default profile home / shared root), and is deliberately **not** resolved through the per-profile `HERMES_HOME`. Every profile's sessions read the same bytes.
+Under Hermes' default multiplexed gateway (`gateway.multiplex_profiles: true`), one gateway process serves many profiles, and **each profile has its own `HERMES_HOME`** (`~/.hermes/profiles/<name>`). A host fact like "this box is `hermes2`, 4 cores, 12 GiB, root, UTC+8" is a property of the *machine*, not of a profile — so the data file lives at an **absolute, profile-independent path**: the resolver walks UP from the live profile `HERMES_HOME` to the shared HERMES root (the first ancestor holding `env-brief.yaml` or a `profiles/` dir), so every profile under the same gateway lands on the SAME file. Fallbacks when the walk finds nothing: `~/.hermes/env-brief.yaml`, and on Windows `%APPDATA%/hermes/env-brief.yaml`. Every profile's sessions read the same bytes.
 
 ### Failure contract
 
-Rendering **fails open**: a missing file, malformed YAML, or missing PyYAML all degrade to a small placeholder section (`"(no env-brief.yaml found…)"`) — they never raise into the prompt build. The same applies to the session-start probe/merge: any exception is swallowed, the session still starts.
+Rendering **fails open**: a missing file, malformed YAML, or missing PyYAML all degrade to a small placeholder section (`"(no env-brief.yaml found…)"`) — they never raise into the prompt build. The same applies to the session-start probe/merge: any exception is caught and **logged** (`env-brief on_session_start probe+merge failed`, with traceback) so a silent failure stays observable, and the session still starts.
 
 ## Features
 
