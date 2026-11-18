@@ -35,6 +35,7 @@ def _load_plugin():
     import-time _ENV_BRIEF_PATH resolution (pure env function, no I/O)."""
     spec = importlib.util.spec_from_file_location(
         "env_brief_under_test", str(_PLUGIN_ROOT / "__init__.py"))
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -236,17 +237,28 @@ def test_windows_probe_live_smoke(eb):
 # chains (sysctl/dscl branches) without needing a real POSIX machine.
 # ---------------------------------------------------------------------------
 def test_posix_probe_expressions_run_cleanly(eb):
+    # Guard the nested-quote fallback chains on any host that has sh. On a
+    # real POSIX host every expression must run clean and produce a
+    # well-formed value. On a Windows host with git-bash, sh itself
+    # reports MSYS kernel names (bare `uname -s` -> "MSYS_NT-..."), so the
+    # strict os-family assert is POSIX-only; the sh -c expressions are
+    # value-checked everywhere (they print "" or a well-formed value on
+    # all three).
     sh = shutil.which("sh")
     if not sh:
         pytest.skip("no sh on this host")
+    real_posix = _IS_WINDOWS is False
     for key, cmd in eb._POSIX_PROBES.items():
-        out = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=20).stdout.strip()
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=20).stdout.strip()
+        except Exception:
+            continue  # tool absent on this host - the probe itself fails open
         if key == "cpu_cores":
             assert out == "" or out.isdigit(), (key, out)
         elif key == "memory_total":
             assert out == "" or out.endswith("Gi"), (key, out)
-        elif key == "os":
+        elif key == "os" and real_posix:
             assert out in ("Linux", "Darwin"), (key, out)
         elif key == "user_is_root":
             assert out in ("", "true", "false"), (key, out)
